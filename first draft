@@ -1,0 +1,171 @@
+% --- 1. Define File Path and Sheet Names ---
+clear; % Clears the workspace
+clc;   % Clears the command window
+
+fprintf('Starting the data loading process...\n\n');
+
+folderName = 'Asset';
+fileName = 'IB9Y8-Asset-Coursework.xlsx';
+fullPath = fullfile(folderName, fileName); 
+
+sheet_portfolios = 'Wanted returns';
+sheet_factors = 'F-F RF';
+
+% --- 2. Load Your Portfolios (Wanted returns) ---
+fprintf('STEP 1: Loading portfolios from: %s\n', sheet_portfolios);
+
+opts = detectImportOptions(fullPath);
+opts.Sheet = sheet_portfolios;
+
+% --- FIX: Select only the first 46 columns (1 Date + 45 Portfolios) ---
+all_vars_port = opts.VariableNames;
+vars_to_keep_port = all_vars_port(1:46); 
+opts.SelectedVariableNames = vars_to_keep_port; % Only load these
+
+% Set the date column type
+dateColName_Port = vars_to_keep_port{1}; 
+opts = setvartype(opts, dateColName_Port, 'datetime'); 
+opts = setvaropts(opts, dateColName_Port, 'InputFormat', 'dd-MMM-yyyy'); 
+
+% Load the table
+MyReturns_table = readtable(fullPath, opts); 
+
+% --- ⭐️ DEBUG: Print first 5 rows of portfolio table ---
+fprintf('\n--- DEBUG: First 5 rows of PORTFOLIO table (as loaded) ---\n');
+disp(MyReturns_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+MyReturns_tt = table2timetable(MyReturns_table, 'RowTimes', dateColName_Port);
+fprintf('...Portfolio loading successful (CLEANED: 45 portfolios).\n\n');
+
+% --- 3. Load Fama-French Factors (F-F RF) ---
+fprintf('STEP 2: Loading factors from: %s\n', sheet_factors);
+
+opts = detectImportOptions(fullPath); 
+opts.Sheet = sheet_factors;
+
+% --- FIX: Select only the first 5 columns (1 Date + 4 Factors) ---
+all_vars_fact = opts.VariableNames;
+vars_to_keep_fact = all_vars_fact(1:5);
+opts.SelectedVariableNames = vars_to_keep_fact; % Only load these
+
+% Set the date column type
+dateColName_Fact = vars_to_keep_fact{1}; 
+opts = setvartype(opts, dateColName_Fact, 'datetime');
+opts = setvaropts(opts, dateColName_Fact, 'InputFormat', 'dd-MMM-yyyy');
+
+% Load the table
+FF_Factors_table = readtable(fullPath, opts);
+
+% --- ⭐️ DEBUG: Print first 5 rows of factor table ---
+fprintf('\n--- DEBUG: First 5 rows of FACTOR table (as loaded) ---\n');
+disp(FF_Factors_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+FF_Factors_tt = table2timetable(FF_Factors_table, 'RowTimes', dateColName_Fact);
+fprintf('...Factor loading successful (CLEANED: 4 factors + RF).\n\n');
+
+% --- 4. Get Portfolio Names BEFORE Merging ---
+portfolioNames = MyReturns_tt.Properties.VariableNames;
+fprintf('...Identified %d clean portfolio names.\n\n', length(portfolioNames));
+
+% --- 5. Synchronize Timetables ---
+fprintf('STEP 3: Synchronizing time series data...\n');
+Data_tt = synchronize(MyReturns_tt, FF_Factors_tt, 'common');
+fprintf('...Data synchronized. Final dimensions: %d obs.\n\n', height(Data_tt));
+
+% --- 6. Prepare Core Matrices for Analysis ---
+fprintf('STEP 4: Preparing matrices for analysis...\n');
+
+MyReturns_mat = Data_tt{:, portfolioNames}; 
+RF_vec = Data_tt.RF;               
+MyExcessReturns_mat = MyReturns_mat - RF_vec; 
+
+if ismember('Mkt_RF', Data_tt.Properties.VariableNames)
+    FF3_mat = [Data_tt.Mkt_RF, Data_tt.SMB, Data_tt.HML];
+else
+    FF3_mat = [Data_tt.('Mkt-RF'), Data_tt.SMB, Data_tt.HML];
+end
+
+fprintf('--- Data loading complete. All matrices are ready. ---\n\n');
+
+
+% --- 7. Construct MOM Factor ---
+fprintf('STEP 5: Constructing MOM factor...\n');
+
+% !! You must justify these choices in your report !!
+L = 12; % Lookback period (e.g., 12 months)
+H = 1;  % Holding period (e.g., 1 month)
+
+% Use raw returns for the signal (MyReturns_mat)
+[T, N] = size(MyReturns_mat); % T=672, N=45
+
+WL_Returns = NaN(T, T); 
+
+for t_form = L : T-1 % t_form is the *end* of the formation period
+    
+    % 1. Calculate Signal
+    lookbackData = MyReturns_mat(t_form - L + 1 : t_form, :);
+    signal = sum(lookbackData, 1); 
+    
+    % 2. Rank and find Winners/Losers
+    numPortfolios = floor(N * 0.20); % 9 portfolios
+    [~, sortedIdx] = sort(signal);
+    
+    losersIdx = sortedIdx(1 : numPortfolios);
+    winnersIdx = sortedIdx(N - numPortfolios + 1 : N);
+    
+    % 3. Calculate and store returns for this cohort's holding period
+    for h = 1 : H
+        if (t_form + h) <= T 
+            winnerReturns = MyReturns_mat(t_form + h, winnersIdx);
+            loserReturns = MyReturns_mat(t_form + h, losersIdx);
+            
+            EW_Winners = mean(winnerReturns);
+            EW_Losers = mean(loserReturns);
+            
+            WL_Returns(t_form + h, t_form) = EW_Winners - EW_Losers;
+        end
+    end
+end
+
+% 4. Calculate final MOM factor as average of overlapping cohorts
+MOM_Factor = NaN(T, 1);
+for t = L+H : T 
+    relevantFormationTimes = t-H : t-1;
+    cohortReturns_t = WL_Returns(t, relevantFormationTimes);
+    MOM_Factor(t) = nanmean(cohortReturns_t);
+end
+
+All_Factors_Model1 = [FF3_mat, MOM_Factor];
+
+fprintf('...MOM factor construction complete.\n\n');
+
+% --- 8. Plot Cumulative MOM Factor Performance ---
+
+% You need the dates from your 'Data_tt' timetable
+Dates = Data_tt.Date;
+
+% We need to find the first valid (non-NaN) data point to start our plot
+first_valid_idx = find(~isnan(MOM_Factor), 1, 'first');
+
+% Get the relevant dates and factor returns (skipping NaNs at the start)
+plot_dates = Dates(first_valid_idx:end);
+plot_mom_returns = MOM_Factor(first_valid_idx:end);
+
+% --- Calculate Cumulative Returns ---
+% We assume the returns in your spreadsheet (e.g., 2.5) are in percent.
+% So, we divide by 100 to get 0.025.
+% cumprod(1 + r) calculates the cumulative growth of $1.
+cumulative_returns = cumprod(1 + plot_mom_returns / 100);
+
+% --- Create the Figure ---
+figure; % Opens a new figure window
+plot(plot_dates, cumulative_returns);
+
+title('Cumulative Return of Industry Momentum (MOM) Factor');
+ylabel('Cumulative Growth of $1');
+xlabel('Year');
+grid on;
+
+fprintf('MOM factor plot created.\n');
