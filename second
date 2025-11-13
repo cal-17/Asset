@@ -1,0 +1,242 @@
+% --- 1. Define File Path and Sheet Names ---
+clear; % Clears the workspace
+clc;   % Clears the command window
+close all; % Closes all open figures
+
+fprintf('Starting the data loading process...\n\n');
+
+folderName = 'Asset';
+fileName = 'IB9Y8-Asset-Coursework.xlsx';
+fullPath = fullfile(folderName, fileName); 
+
+sheet_portfolios = 'Wanted returns';
+sheet_factors = 'F-F RF';
+
+% --- 2. Load Your Portfolios (Wanted returns) ---
+fprintf('STEP 1: Loading portfolios from: %s\n', sheet_portfolios);
+
+opts = detectImportOptions(fullPath);
+opts.Sheet = sheet_portfolios;
+
+% --- FIX: Select only the first 46 columns (1 Date + 45 Portfolios) ---
+all_vars_port = opts.VariableNames;
+vars_to_keep_port = all_vars_port(1:46); 
+opts.SelectedVariableNames = vars_to_keep_port; % Only load these
+
+% Set the date column type
+dateColName_Port = vars_to_keep_port{1}; 
+opts = setvartype(opts, dateColName_Port, 'datetime'); 
+opts = setvaropts(opts, dateColName_Port, 'InputFormat', 'dd-MMM-yyyy'); 
+
+% Load the table
+MyReturns_table = readtable(fullPath, opts); 
+
+% --- ⭐️ DEBUG: Print first 5 rows of portfolio table ---
+fprintf('\n--- DEBUG: First 5 rows of PORTFOLIO table (as loaded) ---\n');
+disp(MyReturns_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+MyReturns_tt = table2timetable(MyReturns_table, 'RowTimes', dateColName_Port);
+fprintf('...Portfolio loading successful (CLEANED: 45 portfolios).\n\n');
+
+% --- 3. Load Fama-French Factors (F-F RF) ---
+fprintf('STEP 2: Loading factors from: %s\n', sheet_factors);
+
+opts = detectImportOptions(fullPath); 
+opts.Sheet = sheet_factors;
+
+% --- FIX: Select only the first 5 columns (1 Date + 4 Factors) ---
+all_vars_fact = opts.VariableNames;
+vars_to_keep_fact = all_vars_fact(1:5);
+opts.SelectedVariableNames = vars_to_keep_fact; % Only load these
+
+% Set the date column type
+dateColName_Fact = vars_to_keep_fact{1}; 
+opts = setvartype(opts, dateColName_Fact, 'datetime');
+opts = setvaropts(opts, dateColName_Fact, 'InputFormat', 'dd-MMM-yyyy');
+
+% Load the table
+FF_Factors_table = readtable(fullPath, opts);
+
+% --- ⭐️ DEBUG: Print first 5 rows of factor table ---
+fprintf('\n--- DEBUG: First 5 rows of FACTOR table (as loaded) ---\n');
+disp(FF_Factors_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+FF_Factors_tt = table2timetable(FF_Factors_table, 'RowTimes', dateColName_Fact);
+fprintf('...Factor loading successful (CLEANED: 4 factors + RF).\n\n');
+
+% --- 4. Get Portfolio Names BEFORE Merging ---
+portfolioNames = MyReturns_tt.Properties.VariableNames;
+fprintf('...Identified %d clean portfolio names.\n\n', length(portfolioNames));
+
+% --- 5. Synchronize Timetables ---
+fprintf('STEP 3: Synchronizing time series data...\n');
+Data_tt = synchronize(MyReturns_tt, FF_Factors_tt, 'common');
+fprintf('...Data synchronized. Final dimensions: %d obs.\n\n', height(Data_tt));
+
+% --- 6. Prepare Core Matrices for Analysis ---
+fprintf('STEP 4: Preparing matrices for analysis...\n');
+
+MyReturns_mat = Data_tt{:, portfolioNames}; 
+RF_vec = Data_tt.RF;               
+MyExcessReturns_mat = MyReturns_mat - RF_vec; 
+
+if ismember('Mkt_RF', Data_tt.Properties.VariableNames)
+    FF3_mat = [Data_tt.Mkt_RF, Data_tt.SMB, Data_tt.HML];
+else
+    FF3_mat = [Data_tt.('Mkt-RF'), Data_tt.SMB, Data_tt.HML];
+end
+
+fprintf('--- Data loading complete. All matrices are ready. ---\n\n');
+
+
+% --- 7. Run MOM Parameter Sweep (L=1:12, H=1:12) ---
+fprintf('STEP 6: Running parameter sweep for L=1:12, H=1:12...\n');
+
+Returns_mat = MyReturns_mat; % Your raw returns
+Dates = Data_tt.Properties.RowTimes;
+
+% This 12x12 matrix will store the *final cumulative return*
+% The row is L, the column is H
+final_returns_matrix = NaN(12, 12);
+
+all_plots = cell(12, 12);
+
+for L = 1:12
+    for H = 1:12
+        % 1. Construct the factor
+        MOM_Factor = constructMOM(L, H, Returns_mat);
+        
+        idx = find(~isnan(MOM_Factor), 1, 'first');
+        if ~isempty(idx) % Check if we got any returns
+            
+            % Get the returns and dates for this *specific* plot
+            plot_ret = MOM_Factor(idx:end);
+            plot_dates = Dates(idx:end);
+            
+            % Calculate the cumulative return series
+            cum_ret = cumprod(1 + plot_ret / 100);
+            
+            % 3. Store the *last* value for the heatmap
+            final_returns_matrix(L, H) = cum_ret(end);
+            all_plots{L, H}.Dates = plot_dates;
+            all_plots{L, H}.Returns = cum_ret;
+        end
+    end
+end
+
+fprintf('...Parameter sweep complete.\n\n');
+
+% --- 8. Print the "Table" of Results ---
+fprintf('STEP 7: Final Cumulative Return for (L, H) Pairs\n');
+
+% We use array2table to make the output clean
+% Row names will be 'L=1', 'L=2', etc.
+% Column names will be 'H=1', 'H=2', etc.
+L_labels = "L=" + string(1:12)';
+H_labels = "H=" + string(1:12);
+
+results_table = array2table(final_returns_matrix, ...
+    'RowNames', L_labels, 'VariableNames', H_labels);
+
+% Print the whole table to the command window
+disp(results_table);
+
+
+% --- 9. Create the Heatmap "Graph" ---
+fprintf('\nSTEP 8: Generating parameter heatmap...\n');
+
+figure; % Create a new figure
+h = heatmap(H_labels, L_labels, final_returns_matrix);
+
+h.Title = 'MOM Strategy: Final Return on $1 by L (Lookback) and H (Holding)';
+h.XLabel = 'Holding Period (H)';
+h.YLabel = 'Lookback Period (L)';
+h.ColorbarVisible = 'on';
+h.Colormap = jet; % You can change this color scheme
+
+fprintf('...Heatmap created.\n\n');
+
+% --- 10. Identify & Plot Top 3 and Bottom 3 Strategies ---
+fprintf('STEP 9: Identifying and plotting best/worst strategies...\n');
+
+[sorted_vals, sorted_idx] = sort(final_returns_matrix(:), 'ascend');
+bottom3_idx = sorted_idx(1:3);
+top3_idx = sorted_idx(end-2:end);
+
+figure; % Create a *second* figure (Figure 2)
+hold on; 
+grid on;
+legend_entries = {}; 
+
+% Plot the 3 Worst (dashed lines)
+for k = 1:3
+    [L_worst, H_worst] = ind2sub([12, 12], bottom3_idx(k));
+    plot_data = all_plots{L_worst, H_worst};
+    plot(plot_data.Dates, plot_data.Returns, '--', 'LineWidth', 1.5);
+    legend_entries{end+1} = sprintf('Worst: L=%d, H=%d (Final: %.2f)', L_worst, H_worst, sorted_vals(k));
+end
+
+% Plot the 3 Best (solid lines)
+for k = 1:3
+    [L_best, H_best] = ind2sub([12, 12], top3_idx(k));
+    plot_data = all_plots{L_best, H_best};
+    plot(plot_data.Dates, plot_data.Returns, '-', 'LineWidth', 2.0);
+    legend_entries{end+1} = sprintf('Best: L=%d, H=%d (Final: %.2f)', L_best, H_best, sorted_vals(end-3+k));
+end
+
+hold off;
+title('MOM Strategy: Best 3 vs. Worst 3 Parameters');
+ylabel('Cumulative Growth of $1');
+xlabel('Year');
+legend(legend_entries, 'Location', 'northwest');
+
+fprintf('...Best/Worst plot created.\n\n');
+
+% --- AA.  ---
+function [MOM_Factor] = constructMOM(L, H, Returns_mat)
+    % This function constructs a momentum factor for a given
+    % L (Lookback), H (Holding), and matrix of Raw Returns.
+    
+    fprintf('...Constructing MOM (L=%d, H=%d)...\n', L, H);
+    
+    [T, N] = size(Returns_mat);
+    WL_Returns = NaN(T, T); 
+
+    for t_form = L : T-1
+        % 1. Calculate Signal
+        lookbackData = Returns_mat(t_form - L + 1 : t_form, :);
+        signal = sum(lookbackData, 1); 
+
+        % 2. Rank and find Winners/Losers
+        numPortfolios = floor(N * 0.20);
+        [~, sortedIdx] = sort(signal);
+        losersIdx = sortedIdx(1 : numPortfolios);
+        winnersIdx = sortedIdx(N - numPortfolios + 1 : N);
+
+        % 3. Calculate and store returns
+        for h = 1 : H
+            if (t_form + h) <= T 
+                winnerReturns = Returns_mat(t_form + h, winnersIdx);
+                loserReturns = Returns_mat(t_form + h, losersIdx);
+                EW_Winners = mean(winnerReturns);
+                EW_Losers = mean(loserReturns);
+                WL_Returns(t_form + h, t_form) = EW_Winners - EW_Losers;
+            end
+        end
+    end
+
+    % 4. Calculate final MOM factor
+    
+    % --- THIS IS THE LINE YOU ARE LIKELY MISSING ---
+    % It initializes the variable, preventing the error.
+    MOM_Factor = NaN(T, 1); 
+    % ------------------------------------------------
+    
+    for t = L+H : T 
+        relevantFormationTimes = t-H : t-1;
+        cohortReturns_t = WL_Returns(t, relevantFormationTimes);
+        MOM_Factor(t) = nanmean(cohortReturns_t);
+    end
+end
