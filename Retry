@@ -1,0 +1,304 @@
+%% 1. ROBUST DATA IMPORT
+clc; clear; close all;
+
+filename = 'IB9Y8-Asset-Coursework.xlsx'; 
+if ~isfile(filename)
+    [file, path] = uigetfile('*.xlsx');
+    filename = fullfile(path, file);
+end
+
+fprintf('Loading Returns (Sheet 4) and Factors (Sheet 5)...\n');
+
+% --- LOAD RETURNS (Sheet 4) ---
+tbl_ind = readtable(filename, 'Sheet', 4, 'VariableNamingRule', 'preserve');
+limit_col = min(46, width(tbl_ind)); 
+tbl_ind = tbl_ind(:, 1:limit_col); 
+
+dates = tbl_ind{:, 1}; 
+industry_returns = tbl_ind{:, 2:end}; 
+portfolio_names = tbl_ind.Properties.VariableNames(2:end);
+
+% --- LOAD FACTORS (Sheet 5) ---
+tbl_ff = readtable(filename, 'Sheet', 5, 'VariableNamingRule', 'preserve');
+vars = tbl_ff.Properties.VariableNames;
+
+idx_mkt = find(contains(vars, 'Mkt', 'IgnoreCase', true), 1);
+if isempty(idx_mkt), idx_mkt = 2; end
+
+idx_rf = find(matches(vars, 'RF', 'IgnoreCase', true) | contains(vars, 'Risk', 'IgnoreCase', true), 1);
+if isempty(idx_rf), idx_rf = width(tbl_ff); end
+
+mkt_excess = tbl_ff{:, idx_mkt};
+rf_rate    = tbl_ff{:, idx_rf};
+
+% --- CLEANING ---
+industry_returns = fillmissing(industry_returns/100, 'constant', 0);
+mkt_excess = fillmissing(mkt_excess/100, 'constant', 0);
+rf_rate = fillmissing(rf_rate/100, 'constant', 0);
+
+min_len = min([length(dates), length(mkt_excess), length(rf_rate)]);
+industry_returns = industry_returns(1:min_len, :);
+mkt_excess = mkt_excess(1:min_len);
+rf_rate = rf_rate(1:min_len);
+dates = dates(1:min_len);
+[T, N] = size(industry_returns);
+
+% ==========================================================
+%      DATA INTEGRITY FLAG (Check for Missing Data)
+% ==========================================================
+missing_count = sum(isnan(industry_returns), 'all');
+
+fprintf('\n------------------------------------------------\n');
+if missing_count > 0
+    fprintf(' [FLAG] WARNING: MISSING DATA DETECTED \n');
+    fprintf(' Found %d missing values (NaNs) in Industry Returns.\n', missing_count);
+    fprintf(' -> Logic: Calculations will continue by ignoring NaNs (Excel Style).\n');
+else
+    fprintf(' [OK] Data Integrity Check Passed: No missing values found.\n');
+end
+fprintf('------------------------------------------------\n');
+
+%% 2. BETTING AGAINST BETA (BAB)
+fprintf('\n--- Calculating BAB ---\n');
+BAB_vol_window = 12; BAB_corr_window = 60; Shrinkage_w = 0.6; 
+bab_factor = nan(T, 1);
+industry_excess = industry_returns - rf_rate;
+start_idx = BAB_corr_window + 1;
+
+for t = start_idx : T
+    idx_vol  = (t - BAB_vol_window : t - 1);
+    idx_corr = (t - BAB_corr_window : t - 1);
+    betas_t = zeros(1, N);
+    for i = 1:N
+        sigma_i = std(industry_excess(idx_vol, i), 'omitnan');
+        sigma_m = std(mkt_excess(idx_vol), 'omitnan');
+        rho_im = corr(industry_excess(idx_corr, i), mkt_excess(idx_corr), 'Rows', 'complete');
+        if sigma_m < 1e-6, sigma_m = 0.0001; end 
+        b_raw = rho_im * (sigma_i / sigma_m);
+        if isnan(b_raw), b_raw = 1; end 
+        betas_t(i) = Shrinkage_w * b_raw + (1 - Shrinkage_w) * 1;
+    end
+    [~, sort_idx] = sort(betas_t);
+    ranks = zeros(1, N); ranks(sort_idx) = 1:N;
+    z_bar = mean(1:N);
+    idx_L = ranks < z_bar; idx_H = ranks > z_bar;
+    w_L = (z_bar - ranks(idx_L)) / sum(z_bar - ranks(idx_L));
+    w_H = (ranks(idx_H) - z_bar) / sum(ranks(idx_H) - z_bar);
+    beta_L = sum(w_L .* betas_t(idx_L)); beta_H = sum(w_H .* betas_t(idx_H));
+    if abs(beta_L) < 0.1, beta_L = 1; end; if abs(beta_H) < 0.1, beta_H = 1; end
+    ret_L = sum(w_L .* industry_returns(t, idx_L));
+    ret_H = sum(w_H .* industry_returns(t, idx_H));
+    bab_factor(t) = (1/beta_L)*(ret_L - rf_rate(t)) - (1/beta_H)*(ret_H - rf_rate(t));
+end
+
+valid_bab = bab_factor(start_idx:end);
+% FIGURE 1: BAB
+figure;
+plot(dates(start_idx:end), cumprod(1 + valid_bab), 'LineWidth', 1.5);
+title('BAB: Growth of $1 (Cumulative Return)'); ylabel('Wealth Index ($)'); grid on;
+fprintf('BAB Sharpe: %.2f | Annual Return: %.2f%%\n', ...
+    (mean(valid_bab)/std(valid_bab))*sqrt(12), mean(valid_bab)*1200);
+
+%% 3. MOMENTUM LOOP
+fprintf('\n--- Calculating Momentum Heatmaps ---\n');
+L_range = 1:12; H_range = 1:12;
+sharpe_matrix = nan(12, 12);
+cum_ret_matrix = nan(12, 12); 
+
+for L = L_range
+    for H = H_range
+        mom_rets = [];
+        
+        % --- FIX: Dynamic Start Date ---
+        % Start exactly when data allows. 
+        % L = Lookback, H = Holding (Max lag). 
+        % We need L months of history before the first formation.
+        start_t = L + H + 1; 
+        
+        for t = start_t : T
+            cohort_sum = 0; valid_cohorts = 0;
+            for lag = 1:H
+                form_t = t - lag;
+                % Ensure we have enough history for this specific cohort
+                if form_t > L
+                    % Signal: Compound returns from t-lag-L to t-lag-1
+                    past_cum = prod(1 + industry_returns(form_t-L:form_t-1, :), 1) - 1;
+                    
+                    [~, sort_idx] = sort(past_cum, 'descend');
+                    n_port = round(0.2 * N);
+                    
+                    % Long Winners, Short Losers
+                    r_W = mean(industry_returns(t, sort_idx(1:n_port)));
+                    r_L = mean(industry_returns(t, sort_idx(end-n_port+1:end)));
+                    
+                    cohort_sum = cohort_sum + (r_W - r_L);
+                    valid_cohorts = valid_cohorts + 1;
+                end
+            end
+            if valid_cohorts > 0, mom_rets = [mom_rets; cohort_sum/valid_cohorts]; end
+        end
+        
+        if ~isempty(mom_rets)
+            sharpe_matrix(L, H) = (mean(mom_rets)/std(mom_rets))*sqrt(12);
+            % Total Return on $1 (Wealth Index)
+            cum_ret_matrix(L, H) = prod(1 + mom_rets); 
+        end
+    end
+end
+
+
+
+% FIGURE 2: Sharpe Heatmap
+figure;
+h1 = heatmap(H_range, L_range, sharpe_matrix);
+h1.Title = 'Sharpe Ratio'; 
+h1.XLabel = 'Holding (H)'; 
+h1.YLabel = 'Lookback (L)'; 
+h1.Colormap = jet;
+
+% FIGURE 3: Return on Dollar Heatmap (Wealth Index)
+figure;
+h2 = heatmap(H_range, L_range, round(cum_ret_matrix, 2));
+h2.Title = 'Wealth Index (Value of $1)'; 
+h2.XLabel = 'Holding (H)'; 
+h2.YLabel = 'Lookback (L)'; 
+h2.Colormap = jet;
+
+%% 4. DEEP DIVE: L=12, H=1
+fprintf('\n============================================\n');
+fprintf('   DEEP DIVE ANALYSIS: L=12, H=1\n');
+fprintf('============================================\n');
+
+L_spec = 12; H_spec = 1;
+spec_mom_rets = [];
+spec_dates = [];
+
+% Identify the FIRST valid month for L=12, H=1
+% We need L=12 months of history. So formation can happen at t=13. 
+% Trading starts at t=14.
+first_trade_t = L_spec + H_spec + 1; 
+
+for t = first_trade_t : T
+    % For H=1, there is only 1 cohort formed at t-1
+    formation_t = t - 1;
+    
+    % 1. Calculate Signal (Past 12 months)
+    idx_start = formation_t - L_spec;
+    idx_end = formation_t - 1;
+    
+    % Cumulative return over past 12 months for ranking
+    past_12m_ret = prod(1 + industry_returns(idx_start:idx_end, :), 1) - 1;
+    
+    % 2. Rank
+    [sorted_rets, sort_idx] = sort(past_12m_ret, 'descend');
+    n_port = round(0.2 * N);
+    
+    winner_idx = sort_idx(1:n_port);
+    loser_idx  = sort_idx(end-n_port+1:end);
+    
+    % 3. Returns in CURRENT month (t)
+    r_W_t = mean(industry_returns(t, winner_idx));
+    r_L_t = mean(industry_returns(t, loser_idx));
+    mom_ret_t = r_W_t - r_L_t;
+    
+    spec_mom_rets = [spec_mom_rets; mom_ret_t];
+    spec_dates = [spec_dates; dates(t)];
+    
+    % --- PRINT DETAILS FOR THE VERY FIRST MONTH ONLY ---
+    if t == first_trade_t
+        fprintf('\n--- First Trading Month: %s ---\n', datestr(dates(t)));
+        fprintf('(Based on performance from %s to %s)\n\n', datestr(dates(idx_start)), datestr(dates(idx_end)));
+        
+        fprintf('WINNERS (Top 20%%)\n');
+        fprintf('%-15s | %-12s | %-12s\n', 'Industry', 'Past 12m Ret', 'Curr Mth Ret');
+        fprintf('-----------------------------------------------\n');
+        for k = 1:length(winner_idx)
+            id = winner_idx(k);
+            fprintf('%-15s | %11.2f%% | %11.2f%%\n', portfolio_names{id}, sorted_rets(k)*100, industry_returns(t, id)*100);
+        end
+        
+        fprintf('\nLOSERS (Bottom 20%%)\n');
+        fprintf('%-15s | %-12s | %-12s\n', 'Industry', 'Past 12m Ret', 'Curr Mth Ret');
+        fprintf('-----------------------------------------------\n');
+        % Losers are at the bottom of the sorted list
+        % sort_idx is Descending, so losers are at the END
+        loser_vals_past = sorted_rets(end-n_port+1:end);
+        
+        for k = 1:length(loser_idx)
+            % Be careful with indices here to match the loop
+            id = loser_idx(k);
+            % Corresponding past return is in loser_vals_past(k)
+            fprintf('%-15s | %11.2f%% | %11.2f%%\n', portfolio_names{id}, loser_vals_past(k)*100, industry_returns(t, id)*100);
+        end
+        fprintf('\n>> MOM Return for this month: %.2f%%\n', mom_ret_t*100);
+    end
+end
+
+% Cumulative Return (Growth of $1)
+wealth_index = cumprod(1 + spec_mom_rets);
+
+% FIGURE 4: L=12, H=1 Specific Plot
+figure;
+plot(spec_dates, wealth_index, 'r', 'LineWidth', 1.5);
+title('Momentum (L=12, H=1): Return on $1');
+ylabel('Wealth Index ($)'); xlabel('Year'); grid on;
+
+fprintf('\nFinal Result for L=12, H=1:\n');
+fprintf('Final value of $1 invested: $%.2f\n', wealth_index(end));
+
+%% --- PRINTING MONTHLY WEALTH INDEX VALUES ---
+
+% 1. BAB WEALTH INDEX
+bab_wealth = cumprod(1 + valid_bab);
+bab_dates  = dates(start_idx:end);
+
+fprintf('\n=========================================\n');
+fprintf('     BAB WEALTH INDEX (Growth of $1)     \n');
+fprintf('=========================================\n');
+fprintf('--- FIRST 5 MONTHS ---\n');
+for i = 1:5
+    fprintf('%s : $%.4f\n', datestr(bab_dates(i)), bab_wealth(i));
+end
+
+fprintf('\n--- LAST 5 MONTHS ---\n');
+for i = length(bab_wealth)-4 : length(bab_wealth)
+    fprintf('%s : $%.4f\n', datestr(bab_dates(i)), bab_wealth(i));
+end
+
+% 2. MOMENTUM (L=12, H=1) WEALTH INDEX
+% We quickly reconstruct the time series for this specific combination
+L_spec = 12; H_spec = 1;
+spec_mom_rets = [];
+spec_dates = [];
+start_t = L_spec + H_spec + 1;
+
+for t = start_t : T
+    form_t = t - 1; % H=1 means lag is 1
+    % Calculate Past 12m Return (Signal)
+    past_cum = prod(1 + industry_returns(form_t-L_spec:form_t-1, :), 1, 'omitnan') - 1;
+    [~, sort_idx] = sort(past_cum, 'descend', 'MissingPlacement', 'last');
+    n_port = round(0.2 * N);
+    
+    % Winner - Loser
+    r_W = mean(industry_returns(t, sort_idx(1:n_port)), 'omitnan');
+    r_L = mean(industry_returns(t, sort_idx(end-n_port+1:end)), 'omitnan');
+    
+    spec_mom_rets = [spec_mom_rets; (r_W - r_L)];
+    spec_dates = [spec_dates; dates(t)];
+end
+
+mom_wealth = cumprod(1 + spec_mom_rets);
+
+fprintf('\n=========================================\n');
+fprintf('   MOMENTUM (L=12, H=1) WEALTH INDEX     \n');
+fprintf('=========================================\n');
+fprintf('--- FIRST 5 MONTHS ---\n');
+for i = 1:5
+    fprintf('%s : $%.4f\n', datestr(spec_dates(i)), mom_wealth(i));
+end
+
+fprintf('\n--- LAST 5 MONTHS ---\n');
+for i = length(mom_wealth)-4 : length(mom_wealth)
+    fprintf('%s : $%.4f\n', datestr(spec_dates(i)), mom_wealth(i));
+end
+fprintf('\n');
