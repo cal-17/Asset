@@ -1,0 +1,637 @@
+%% --- 1. Define File Path and Sheet Names ---
+clear;
+clc; 
+close all;
+
+fprintf('Starting the data loading process...\n\n');
+
+folderName = 'Asset';
+fileName = 'IB9Y8-Asset-Coursework.xlsx';
+fullPath = fullfile(folderName, fileName); 
+
+sheet_portfolios = 'Wanted returns';
+sheet_factors = 'F-F RF';
+
+% --- 2. Load Portfolios (Wanted returns) ---
+fprintf('STEP 1: Loading portfolios from: %s\n', sheet_portfolios);
+
+opts = detectImportOptions(fullPath);
+opts.Sheet = sheet_portfolios;
+
+% --- Select only the first 46 columns (1 Date + 45 Portfolios) ---
+all_vars_port = opts.VariableNames;
+vars_to_keep_port = all_vars_port(1:46); 
+opts.SelectedVariableNames = vars_to_keep_port; % Only load these
+
+% Set the date column type
+dateColName_Port = vars_to_keep_port{1}; 
+opts = setvartype(opts, dateColName_Port, 'datetime'); 
+opts = setvaropts(opts, dateColName_Port, 'InputFormat', 'dd-MMM-yyyy'); 
+
+% Load the table
+MyReturns_table = readtable(fullPath, opts); 
+
+% --- DEBUG: Print first 5 rows of portfolio table ---
+fprintf('\n--- DEBUG: First 5 rows of PORTFOLIO table (as loaded) ---\n');
+disp(MyReturns_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+MyReturns_tt = table2timetable(MyReturns_table, 'RowTimes', dateColName_Port);
+fprintf('...Portfolio loading successful (CLEANED: 45 portfolios).\n\n');
+
+% --- 3. Load Fama-French Factors (F-F RF) ---
+fprintf('STEP 2: Loading factors from: %s\n', sheet_factors);
+
+opts = detectImportOptions(fullPath); 
+opts.Sheet = sheet_factors;
+
+% --- FIX: Select only the first 5 columns (1 Date + 4 Factors) ---
+all_vars_fact = opts.VariableNames;
+vars_to_keep_fact = all_vars_fact(1:5);
+opts.SelectedVariableNames = vars_to_keep_fact; % Only load these
+
+% Set the date column type
+dateColName_Fact = vars_to_keep_fact{1}; 
+opts = setvartype(opts, dateColName_Fact, 'datetime');
+opts = setvaropts(opts, dateColName_Fact, 'InputFormat', 'dd-MMM-yyyy');
+
+% Load the table
+FF_Factors_table = readtable(fullPath, opts);
+
+% --- DEBUG: Print first 5 rows of factor table ---
+fprintf('\n--- DEBUG: First 5 rows of FACTOR table (as loaded) ---\n');
+disp(FF_Factors_table(1:5, :));
+fprintf('--- End of Debug ---\n\n');
+
+FF_Factors_tt = table2timetable(FF_Factors_table, 'RowTimes', dateColName_Fact);
+fprintf('...Factor loading successful (CLEANED: 4 factors + RF).\n\n');
+
+% --- 4. Get Portfolio Names BEFORE Merging ---
+portfolioNames = MyReturns_tt.Properties.VariableNames;
+fprintf('...Identified %d clean portfolio names.\n\n', length(portfolioNames));
+
+% --- 5. Synchronize Timetables ---
+fprintf('STEP 3: Synchronizing time series data...\n');
+Data_tt = synchronize(MyReturns_tt, FF_Factors_tt, 'common');
+fprintf('...Data synchronized. Final dimensions: %d obs.\n\n', height(Data_tt));
+
+%% --- 6. Prepare Core Matrices for Analysis ---
+fprintf('STEP 4: Preparing matrices for analysis...\n');
+
+MyReturns_mat = Data_tt{:, portfolioNames}; 
+RF_vec = Data_tt.RF;               
+MyExcessReturns_mat = MyReturns_mat - RF_vec; 
+
+if ismember('Mkt_RF', Data_tt.Properties.VariableNames)
+    FF3_mat = [Data_tt.Mkt_RF, Data_tt.SMB, Data_tt.HML];
+else
+    FF3_mat = [Data_tt.('Mkt-RF'), Data_tt.SMB, Data_tt.HML];
+end
+
+fprintf('--- Data loading complete. All matrices are ready. ---\n\n');
+
+
+% --- 7. Run MOM Parameter Sweep (L=1:12, H=1:12) ---
+fprintf('STEP 6: Running parameter sweep for L=1:12, H=1:12...\n');
+
+Returns_mat = MyReturns_mat; % Your raw returns
+Dates = Data_tt.Properties.RowTimes;
+
+% This 12x12 matrix will store the *final cumulative return*
+% The row is L, the column is H
+final_returns_matrix = NaN(12, 12);
+
+all_plots = cell(12, 12);
+
+for L = 1:12
+    for H = 1:12
+        % 1. Construct the factor
+        MOM_Factor = constructMOM(L, H, Returns_mat);
+        
+        idx = find(~isnan(MOM_Factor), 1, 'first');
+        if ~isempty(idx) % Check if we got any returns
+            
+            % Get the returns and dates for this *specific* plot
+            plot_ret = MOM_Factor(idx:end);
+            plot_dates = Dates(idx:end);
+            
+            % Calculate the cumulative return series
+            cum_ret = cumprod(1 + plot_ret / 100);
+            
+            % 3. Store the *last* value for the heatmap
+            final_returns_matrix(L, H) = cum_ret(end);
+            all_plots{L, H}.Dates = plot_dates;
+            all_plots{L, H}.Returns = cum_ret;
+        end
+    end
+end
+
+fprintf('...Parameter sweep complete.\n\n');
+
+
+
+%% --- 8. Print the "Table" of Results ---------------------------------------------------
+fprintf('STEP 7: Final Cumulative Return for (L, H) Pairs\n');
+
+% We use array2table to make the output clean
+% Row names will be 'L=1', 'L=2', etc.
+% Column names will be 'H=1', 'H=2', etc.
+L_labels = "L=" + string(1:12)';
+H_labels = "H=" + string(1:12);
+
+results_table = array2table(final_returns_matrix, ...
+    'RowNames', L_labels, 'VariableNames', H_labels);
+
+% Print the whole table to the command window
+disp(results_table);
+
+
+% --- 9. Create the Heatmap "Graph" ---
+fprintf('\nSTEP 8: Generating parameter heatmap...\n');
+
+figure; % Create a new figure
+h = heatmap(H_labels, L_labels, final_returns_matrix);
+
+h.Title = 'Final Return on $1';
+h.XLabel = 'Holding Period (H)';
+h.YLabel = 'Lookback Period (L)';
+h.ColorbarVisible = 'on';
+h.Colormap = jet; % You can change this color scheme
+
+fprintf('...Heatmap created.\n\n');
+
+% --- 13. Decade-by-Decade Heatmap Analysis (Single Grid Window) ---
+fprintf('STEP 13: Generating styled heatmaps for each decade (Grid Layout)...\n');
+
+% 1. Define Decades
+decade_starts = [1970, 1980, 1990, 2000, 2010, 2020];
+decade_names  = {'1970s', '1980s', '1990s', '2000s', '2010s', '2020s'};
+
+% 2. Setup Labels
+L_labels = string(1:12); 
+H_labels = string(1:12); 
+
+% 4. Loop through each decade
+for k = 1:length(decade_starts)
+    
+    startYear = decade_starts(k);
+    endYear = startYear + 9;
+    
+    % Prepare the 12x12 matrix for this decade
+    decade_matrix = NaN(12, 12);
+    
+    for L = 1:12
+        for H = 1:12
+            % Retrieve stored data
+            if ~isempty(all_plots{L, H})
+                stored_dates = all_plots{L, H}.Dates;
+                stored_cum_returns = all_plots{L, H}.Returns;
+                
+                % Find indices for this decade
+                stored_years = year(stored_dates);
+                idx_decade = (stored_years >= startYear) & (stored_years <= endYear);
+                
+                vals_in_decade = stored_cum_returns(idx_decade);
+                
+                if ~isempty(vals_in_decade)
+                    start_val = vals_in_decade(1);   % Value at start
+                    end_val = vals_in_decade(end);   % Value at end
+                    
+                    % Growth Calculation
+                    decade_matrix(L, H) = end_val / start_val;
+                end
+            end
+        end
+    end
+    
+    figure;
+    % Create the smart heatmap
+    h = heatmap(H_labels, L_labels, decade_matrix);
+    
+    % Apply your specific styling
+    h.Title = [decade_names{k} ' Return on $1'];
+    h.XLabel = 'Holding Period (H)'; 
+    h.YLabel = 'Lookback Period (L)';
+    h.ColorbarVisible = 'on';
+    h.Colormap = jet; % The rainbow color scheme
+end
+
+fprintf('...Decade subplot grid created.\n\n');
+
+% %% --- 10. Identify & Plot Top 3 and Bottom 3 Strategies ---
+% fprintf('STEP 9: Identifying and plotting best/worst strategies...\n');
+% 
+% [sorted_vals, sorted_idx] = sort(final_returns_matrix(:), 'ascend');
+% bottom3_idx = sorted_idx(1:3);
+% top3_idx = sorted_idx(end-2:end);
+% 
+% figure; % Create a *second* figure (Figure 2)
+% hold on; 
+% grid on;
+% legend_entries = {}; 
+% 
+% % Plot the 3 Worst (dashed lines)
+% for k = 1:3
+%     [L_worst, H_worst] = ind2sub([12, 12], bottom3_idx(k));
+%     plot_data = all_plots{L_worst, H_worst};
+%     plot(plot_data.Dates, plot_data.Returns, '--', 'LineWidth', 1.5);
+%     legend_entries{end+1} = sprintf('Worst: L=%d, H=%d (Final: %.2f)', L_worst, H_worst, sorted_vals(k));
+% end
+% 
+% % Plot the 3 Best (solid lines)
+% for k = 1:3
+%     [L_best, H_best] = ind2sub([12, 12], top3_idx(k));
+%     plot_data = all_plots{L_best, H_best};
+%     plot(plot_data.Dates, plot_data.Returns, '-', 'LineWidth', 2.0);
+%     legend_entries{end+1} = sprintf('Best: L=%d, H=%d (Final: %.2f)', L_best, H_best, sorted_vals(end-3+k));
+% end
+% 
+% hold off;
+% title('MOM Strategy: Best 3 vs. Worst 3 Parameters');
+% ylabel('Cumulative Growth of $1');
+% xlabel('Year');
+% legend(legend_entries, 'Location', 'northwest');
+% 
+% fprintf('...Best/Worst plot created.\n\n');
+
+%% --- 11. Plot All 144 Cumulative Return Lines (Color) ---
+fprintf('STEP 10: Generating "spaghetti plot" of all 144 strategies...\n');
+
+figure; % Create a new figure
+hold on; 
+grid on;
+
+% Get a colormap with 144 distinct colors (from blue to red)
+colors = jet(144); 
+k = 1; % Counter for the colors
+
+% Loop through every L and H combination
+for L = 1:12
+    for H = 1:12
+        % Check if data exists for this (L,H) pair
+        if ~isempty(all_plots{L, H})
+            % Get the plot data we stored
+            plot_data = all_plots{L, H};
+            
+            % Get the specific color for this line (e.g., colors(1,:))
+            line_color = colors(k, :);
+            
+            % Plot the line. We make it thin and semi-transparent
+            % We add '0.1' (alpha) to the end of the [R, G, B] color
+            plot(plot_data.Dates, plot_data.Returns, 'LineWidth', 0.5, 'Color', [line_color, 0.1]); 
+        end
+        k = k + 1; % Move to the next color
+    end
+end
+
+hold off; % We are done plotting
+title('MOM Strategy: All 144 (L, H) Parameter Combinations');
+ylabel('Cumulative Growth of $1');
+xlabel('Year');
+
+fprintf('...Spaghetti plot created.\n\n');
+
+% % --- 11. Print Annual Returns for *All* Strategies ---
+% fprintf('STEP 11: Calculating annual returns for all 144 strategies...\n');
+% 
+% Dates = Data_tt.Properties.RowTimes;
+% 
+% for L = 1:12
+%     for H = 1:12
+% 
+%         % 1. Re-run constructMOM to get its *monthly* returns
+%         MOM_Factor = constructMOM(L, H, MyReturns_mat);
+% 
+%         % 2. Create a timetable (needed for retime)
+%         first_valid = find(~isnan(MOM_Factor), 1, 'first');
+% 
+%         if ~isempty(first_valid)
+%             Dates_clean = Dates(first_valid:end);
+%             Returns_clean = MOM_Factor(first_valid:end) / 100; 
+% 
+%             tt = timetable(Dates_clean, Returns_clean, 'VariableNames', {'MonthlyReturn'});
+% 
+%             % 3. Resample to yearly
+%             tt_annual = retime(tt, 'yearly', @(x) prod(1+x)-1);
+% 
+%             % 4. Format for clean printing
+% 
+%             % --- THIS IS THE FIX ---
+%             Years = year(tt_annual.Properties.RowTimes); % Get the year number
+%             % --- END OF FIX ---
+% 
+%             Annual_Return_Percent = tt_annual.MonthlyReturn * 100; 
+%             results_table_annual = table(Years, Annual_Return_Percent);
+% 
+%             % 5. Display the table in the command window
+%             fprintf('\n--- Annual Returns for Strategy (L=%d, H=%d) ---\n', L, H);
+%             disp(results_table_annual);
+%         end
+%     end
+% end
+% 
+% fprintf('--- End of All Annual Tables ---\n\n');
+
+%% --- AA.  ---
+function [MOM_Factor] = constructMOM(L, H, Returns_mat)
+    % This function constructs a momentum factor for a given
+    % L (Lookback), H (Holding), and matrix of Raw Returns.
+    
+    fprintf('...Constructing MOM (L=%d, H=%d)...\n', L, H);
+    
+    [T, N] = size(Returns_mat);
+    WL_Returns = NaN(T, T); 
+
+    for t_form = L : T-1
+        % 1. Calculate Signal
+        lookbackData = Returns_mat(t_form - L + 1 : t_form, :);
+        signal = prod(1 + lookbackData/100, 1) -1; %% FIX
+ 
+        % 2. Rank and find Winners/Losers (NAN-SAFE)
+        signal_rounded = round(signal, 10);
+        numPortfolios = floor(N * 0.20);
+
+        % --- NAN-SAFE SORT ---
+        validMask = ~isnan(signal_rounded);
+        validCols = find(validMask);
+
+        [~, sortedValid] = sort(signal_rounded(validMask));
+
+        losersIdx  = validCols(sortedValid(1 : numPortfolios));
+        winnersIdx = validCols(sortedValid(end - numPortfolios + 1 : end));
+        % ----------------------
+
+        % 3. Calculate and store returns
+        for h = 1 : H
+            if (t_form + h) <= T 
+                winnerReturns = Returns_mat(t_form + h, winnersIdx);
+                loserReturns  = Returns_mat(t_form + h, losersIdx);
+                EW_Winners = mean(winnerReturns);
+                EW_Losers  = mean(loserReturns);
+                WL_Returns(t_form + h, t_form) = EW_Winners - EW_Losers;
+            end
+        end
+    end
+
+    % 4. Calculate final MOM factor
+    MOM_Factor = NaN(T, 1); 
+
+    for t = L+H : T 
+        relevantFormationTimes = t-H : t-1;
+        cohortReturns_t = WL_Returns(t, relevantFormationTimes);
+        MOM_Factor(t) = nanmean(cohortReturns_t);
+    end
+end
+
+% --- 12. Deep Dive: Winners, Losers, and Cumulative Growth ---
+fprintf('STEP 12: Running deep-dive analysis for a specific strategy...\n');
+
+% 1. Choose your parameters
+L_dive = 12; % Lookback
+H_dive = 1;  % Holding
+
+fprintf('Analyzing Strategy: Lookback=%d, Holding=%d\n', L_dive, H_dive);
+
+% 2. Setup Data
+Returns_mat = MyReturns_mat;
+Dates = Data_tt.Properties.RowTimes;
+PortNames = Data_tt.Properties.VariableNames; 
+[T, N] = size(Returns_mat);
+
+% 3. Pre-allocate storage
+num_rows = T - (L_dive + H_dive) + 1;
+dive_Dates = Dates(L_dive+H_dive : end); 
+dive_Returns = zeros(num_rows, 1);
+dive_Winners = strings(num_rows, 1); 
+dive_Losers  = strings(num_rows, 1);
+
+% 4. Run the Loop
+row_counter = 1;
+
+for t = L_dive+H_dive : T
+    
+    % A. Calculate Factor Return
+    relevantFormationTimes = t-H_dive : t-1;
+    cohortReturns = [];
+    
+    for t_form = relevantFormationTimes
+        
+        lookbackData = Returns_mat(t_form - L_dive + 1 : t_form, :);
+        signal = sum(lookbackData, 1);
+
+        numPortfolios = floor(N * 0.20);
+
+        % --- NAN-SAFE SORT ---
+        validMask = ~isnan(signal);
+        validCols = find(validMask);
+
+        [~, sortedValid] = sort(signal(validMask));
+
+        losersIdx  = validCols(sortedValid(1 : numPortfolios));
+        winnersIdx = validCols(sortedValid(end - numPortfolios + 1 : end));
+        % ----------------------
+
+        R_W = mean(Returns_mat(t, winnersIdx));
+        R_L = mean(Returns_mat(t, losersIdx));
+        cohortReturns(end+1) = R_W - R_L;
+        
+        % B. Capture Names (recent cohort only)
+        if t_form == t-1
+
+            % Debug block unchanged
+            if t == L_dive + H_dive
+                losersIdx_debug = losersIdx; 
+                fprintf('DEBUG: Loser Column Indices (t=%s): %s\n', datestr(Dates(t_form)), num2str(losersIdx_debug));
+                LoserNames_Debug = PortNames(losersIdx_debug);
+                fprintf('DEBUG: Loser Portfolio Names: %s\n', strjoin(LoserNames_Debug, ', '));
+            end
+             
+            names_W = strjoin(PortNames(winnersIdx), ', ');
+            names_L = strjoin(PortNames(losersIdx), ', ');
+        end
+    end
+    
+    % Store monthly data
+    dive_Returns(row_counter) = mean(cohortReturns);
+    dive_Winners(row_counter) = names_W;
+    dive_Losers(row_counter)  = names_L;
+    
+    row_counter = row_counter + 1;
+
+end
+
+% --- NEW: Calculate Cumulative Growth ---
+dive_Growth = cumprod(1 + dive_Returns / 100);
+
+% 5. Create Table with the NEW Column
+DeepDiveTable = table(dive_Dates, dive_Returns, dive_Growth, dive_Winners, dive_Losers, ...
+    'VariableNames', {'Date', 'Return_Pct', 'Growth_of_1_Dollar', 'Top_Winners', 'Top_Losers'});
+
+% Display
+fprintf('\n--- Deep Dive Results (First 20 Months) ---\n');
+disp(DeepDiveTable(1:20, :)); 
+
+fprintf('\n--- Deep Dive Results (Last 20 Months) ---\n');
+disp(DeepDiveTable(end-19:end, :)); 
+
+fprintf('Tip: Double-click "DeepDiveTable" in your Workspace to see the full history.\n\n');
+
+% --- 15. Construct Betting Against Beta (BAB) Factor ---
+fprintf('STEP 15: Constructing BAB Factor (Frazzini & Pedersen methodology)...\n');
+
+% 1. Setup Data
+[T, N] = size(MyExcessReturns_mat);
+Mkt_RF = FF3_mat(:, 1); % Market Excess Return
+Dates  = Data_tt.Properties.RowTimes;
+
+BAB_Factor = NaN(T, 1);
+min_obs = 60; % Need 60 months for correlation
+
+% 2. Rolling Window Loop
+for t = min_obs + 1 : T
+    
+    % --- A. Estimate Pre-Ranking Betas (using data up to t-1) ---
+    
+    % Window for Correlation (Past 60 months)
+    idx_60 = (t-60) : (t-1);
+    ret_60 = MyExcessReturns_mat(idx_60, :);
+    mkt_60 = Mkt_RF(idx_60);
+    
+    % Window for Volatility (Past 12 months)
+    idx_12 = (t-12) : (t-1);
+    ret_12 = MyExcessReturns_mat(idx_12, :);
+    mkt_12 = Mkt_RF(idx_12);
+    
+    % Calculate Volatilities (Sigma)
+    sig_i = std(ret_12, 0, 1); % Industry Vol (1x45)
+    sig_m = std(mkt_12);       % Market Vol (Scalar)
+    
+    % Calculate Correlations (Rho)
+    rho_im = zeros(1, N);
+    for i = 1:N
+        rho_im(i) = corr(ret_60(:, i), mkt_60);
+    end
+    
+    % Calculate Raw Beta & Shrinkage
+    beta_raw = rho_im .* (sig_i / sig_m);
+    beta_shrunk = 0.6 * beta_raw + 0.4;
+    
+    % --- B. Form Portfolios (Rank & Weight) ---
+    [sorted_betas, sort_idx] = sort(beta_shrunk);
+    median_beta = median(sorted_betas);
+    
+    idx_Low  = sort_idx(beta_shrunk <= median_beta);
+    idx_High = sort_idx(beta_shrunk > median_beta);
+    
+    % Calculate Rank-Based Weights
+    % (Helper function 'calc_rank_weights' must be at end of script)
+    w_L = calc_rank_weights(beta_shrunk(idx_Low), 'descend'); 
+    w_H = calc_rank_weights(beta_shrunk(idx_High), 'ascend');
+    
+    % --- C. Calculate Returns & Rescale ---
+    
+    % Current Month Excess Returns
+    R_t = MyExcessReturns_mat(t, :);
+    
+    % Weighted Excess Returns
+    R_Low_Excess  = sum(R_t(idx_Low)  .* w_L);
+    R_High_Excess = sum(R_t(idx_High) .* w_H);
+    
+    % Weighted Betas
+    beta_Low_Port  = sum(beta_shrunk(idx_Low)  .* w_L);
+    beta_High_Port = sum(beta_shrunk(idx_High) .* w_H);
+    
+    % BAB Factor Calculation (Leveraged Low minus De-leveraged High)
+    BAB_Factor(t) = (R_Low_Excess / beta_Low_Port) - (R_High_Excess / beta_High_Port);
+end
+
+fprintf('...BAB Factor constructed.\n');
+
+% --- 16. Create Table and Print First 5 / Last 5 ---
+fprintf('STEP 16: displaying BAB results...\n');
+
+% Create the table
+BAB_Table = table(Dates, BAB_Factor, 'VariableNames', {'Date', 'BAB_Return'});
+
+% Find valid indices (skip the first 60 NaNs)
+valid_idx = find(~isnan(BAB_Factor));
+first_5_idx = valid_idx(1:5);
+last_5_idx  = valid_idx(end-4:end);
+
+fprintf('\n--- BAB Factor: First 5 Valid Rows ---\n');
+disp(BAB_Table(first_5_idx, :));
+
+fprintf('\n--- BAB Factor: Last 5 Valid Rows ---\n');
+disp(BAB_Table(last_5_idx, :));
+
+% --- 17. Plot Cumulative BAB Performance ---
+fprintf('STEP 17: Plotting BAB performance...\n');
+idx_start = valid_idx(1);
+dates_plot = Dates(idx_start:end);
+rets_plot  = BAB_Factor(idx_start:end); 
+cum_bab = cumprod(1 + rets_plot / 100);
+
+figure('Name', 'BAB Factor Performance', 'WindowStyle', 'docked');
+plot(dates_plot, cum_bab, 'LineWidth', 1.5, 'Color', '#D95319'); 
+title('Cumulative Return of Betting Against Beta (BAB) Factor');
+ylabel('Growth of $1');
+xlabel('Year');
+grid on;
+
+% Combine for Model 2
+All_Factors_Model2 = [FF3_mat, BAB_Factor];
+fprintf('...BAB Factor ready for regression testing.\n\n');
+
+% --- Helper Function for BAB Weights ---
+function w = calc_rank_weights(vals, direction)
+    % 1. Rank the values based on direction
+    [~, sort_p] = sort(vals, direction);
+    
+    % 2. Assign ranks (1 to N)
+    ranks = zeros(size(vals));
+    ranks(sort_p) = 1:length(vals); 
+    
+    % 3. Normalize to sum to 1
+    w = ranks / sum(ranks);
+end
+
+%% --- 5C. Calculate and Display 12-Month Cumulative Growth (Mirroring Excel F2:F13) ---
+fprintf('STEP 5C: Calculating Cumulative Percentage Growth over the FIRST 12 Months...\n');
+
+% 1. Get the monthly return data and names
+Returns_mat = MyReturns_mat;
+PortfolioNames = portfolioNames; 
+
+% 2. Identify the rows corresponding to the first 12 months. 
+% (The data in MyReturns_mat starts at index 1)
+start_row = 1;
+end_row = 12;
+
+% Check if enough data exists
+if size(Returns_mat, 1) < end_row
+    fprintf('...ERROR: Only %d months of data available. Cannot calculate 12-month growth.\n', size(Returns_mat, 1));
+else
+    % 3. Extract the returns for the first 12 months for ALL 45 portfolios
+    Returns_12M = Returns_mat(start_row:end_row, :);
+
+    % 4. Convert returns from percent (e.g., 5.0) to decimal (0.05) and add 1
+    % This is the (1 + R) part of the Excel formula
+    Growth_Factor_mat_12M = 1 + (Returns_12M / 100);
+    
+    % 5. Calculate the cumulative product (PRODUCT function in Excel) down the time dimension (dimension 1)
+    % The result is the final growth factor for the 12th month.
+    Final_Growth_Factor_12M = prod(Growth_Factor_mat_12M, 1);
+    
+    % 6. Calculate the final percentage growth (PRODUCT(...) - 1) * 100
+    Final_Growth_Percent_12M = (Final_Growth_Factor_12M - 1) * 100;
+    
+    % 7. Create the final results table (1 row, 45 columns)
+    Initial_12M_Growth_Results = array2table(Final_Growth_Percent_12M, ...
+        'VariableNames', PortfolioNames, ...
+        'RowNames', {'12-Month Growth (%) (196907 to 197006)'});
+    
+    % 8. Display the results
+    fprintf('\n--- Cumulative Percentage Growth for Each Portfolio over the Initial 12 Months ---\n');
+    disp(Initial_12M_Growth_Results);
+    fprintf('...12-Month growth calculation complete.\n\n');
+end
