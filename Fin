@@ -1,0 +1,902 @@
+% ASSET CODE
+clc;
+clear;
+close all;
+
+filename = 'IB9Y8-Asset-Coursework.xlsx'; 
+if ~isfile(filename)
+    [file, path] = uigetfile('*.xlsx');
+    filename = fullfile(path, file);
+end
+
+fprintf('Loading Returns (Sheet 4) and Factors (Sheet 5)\n');
+
+% Global
+MAX_L = 12;     
+MAX_H = 12;     
+
+L_range = 1:MAX_L;
+H_range = 1:MAX_H;
+
+L_specific = 12;
+H_specific = 1;
+
+trading_cost = 0.0015; 
+
+% Month Inspector
+target_month= 12;    % Month 
+target_year  = 1970;  % Year 
+
+% BAB
+BAB_vol_window = 12;
+BAB_corr_window = 60;
+BAB_Shrinkage = 0.6; 
+
+global_models = {
+    1:3,          {'Mkt','SMB','HML'},             'Benchmark FF3',            '#D95319';
+    [1 2 3 5],    {'Mkt','SMB','HML','BAB'},       'Model A (FF3 + BAB)',      '#EDB120';
+    1:4,          {'Mkt','SMB','HML','MOM'},       'Model B (FF3 + MOM)',      '#0072BD';
+    1:5,          {'Mkt','SMB','HML','MOM','BAB'}, 'Model C (Full 5-Factor)',  '#77AC30'
+    };
+
+% --- LOAD RETURNS (Sheet 4) ---
+tbl_return = readtable(filename, 'Sheet', 4, 'VariableNamingRule', 'preserve');
+limit_colunm = min(46, width(tbl_return)); 
+tbl_return = tbl_return(:, 1:limit_colunm); 
+
+raw_dates = tbl_return{:, 1};
+dates = datetime(raw_dates);
+
+industry_returns = tbl_return{:, 2:end}; 
+portfolio_names = tbl_return.Properties.VariableNames(2:end);
+
+% --- LOAD FACTORS (Sheet 5) ---
+tbl_ff = readtable(filename, 'Sheet', 5, 'VariableNamingRule', 'preserve');
+vars = tbl_ff.Properties.VariableNames;
+
+idx_mkt = find(contains(vars, 'Mkt', 'IgnoreCase', true), 1);
+idx_rf = find(matches(vars, 'RF', 'IgnoreCase', true), 1);
+idx_smb = find(contains(vars, 'SMB', 'IgnoreCase', true), 1);
+idx_hml = find(contains(vars, 'HML', 'IgnoreCase', true), 1);
+
+mkt_excess = tbl_ff{:, idx_mkt};
+rf_rate    = tbl_ff{:, idx_rf};
+smb_factor = tbl_ff{:, idx_smb}; 
+hml_factor = tbl_ff{:, idx_hml};
+
+% Dates
+if isnumeric(raw_dates)
+    dates = datetime(raw_dates, 'ConvertFrom', 'excel');
+elseif iscell(raw_dates) || isstring(raw_dates)
+    dates = datetime(raw_dates);
+else
+    dates = raw_dates; 
+end
+
+% Cleaning
+industry_returns = fillmissing(industry_returns/100, 'constant', 0);
+mkt_excess = fillmissing(mkt_excess/100, 'constant', 0);
+rf_rate = fillmissing(rf_rate/100, 'constant', 0);
+smb_factor = fillmissing(smb_factor/100, 'constant', 0);
+hml_factor = fillmissing(hml_factor/100, 'constant', 0);
+
+min_len = min([length(dates), length(mkt_excess), length(rf_rate)]);
+industry_returns = industry_returns(1:min_len, :);
+mkt_excess = mkt_excess(1:min_len);
+rf_rate = rf_rate(1:min_len);
+smb_factor = smb_factor(1:min_len);
+hml_factor = hml_factor(1:min_len);
+
+dates = dates(1:min_len);
+[T, N] = size(industry_returns);
+
+missing_count = sum(isnan(industry_returns), 'all');
+fprintf('\n------------------------------------------------\n');
+if missing_count > 0
+    fprintf('Missing data\n');
+    fprintf(' Found %d missing values (NaNs) in Industry Returns.\n', missing_count);
+else
+    fprintf('No missing data\n');
+end
+fprintf('------------------------------------------------\n');
+
+%% Betting Against Beta BAB
+
+bab_factor = nan(T, 1);
+bab_Low_leg = nan(T, 1);  
+bab_High_leg = nan(T, 1);
+
+industry_excess = industry_returns - rf_rate;
+start_idx = BAB_corr_window + 1;
+
+for t = start_idx : T
+    idx_vol  = (t - BAB_vol_window : t - 1);
+    idx_corr = (t - BAB_corr_window : t - 1);
+    betas_t = nan(1, N);
+
+    for i = 1:N
+        sigma_i = std(industry_excess(idx_vol, i), 'omitnan');
+        sigma_m = std(mkt_excess(idx_vol), 'omitnan');
+        rho_im = corr(industry_excess(idx_corr, i), mkt_excess(idx_corr), 'Rows', 'complete');
+        if sigma_m < 1e-6, sigma_m = 0.0001;
+        end
+
+        b_raw = rho_im * (sigma_i / sigma_m);
+
+        if isnan(b_raw), b_raw = 1;
+        end
+        betas_t(i) = BAB_Shrinkage * b_raw + (1 - BAB_Shrinkage) * 1;
+    end
+
+    [~, sort_idx] = sort(betas_t);
+    ranks = nan(1, N); ranks(sort_idx) = 1:N;
+    z_bar = mean(1:N);
+    idx_L = ranks < z_bar; idx_H = ranks > z_bar;
+    w_L = (z_bar - ranks(idx_L)) / sum(z_bar - ranks(idx_L));
+    w_H = (ranks(idx_H) - z_bar) / sum(ranks(idx_H) - z_bar);
+    beta_L = sum(w_L .* betas_t(idx_L)); beta_H = sum(w_H .* betas_t(idx_H));
+   
+    if abs(beta_L) < 0.1, beta_L = 1;
+    end
+    if abs(beta_H) < 0.1, beta_H = 1;
+    end
+
+    ret_L = sum(w_L .* industry_returns(t, idx_L));
+    ret_H = sum(w_H .* industry_returns(t, idx_H));
+
+    bab_L = (1/beta_L) * (ret_L - rf_rate(t));
+    bab_H = (1/beta_H) * (ret_H - rf_rate(t));
+
+    bab_Low_leg(t) = bab_L;
+    bab_High_leg(t) = bab_H;
+    bab_factor(t)  = bab_L - bab_H;
+end
+
+tbl_L_bab   = bab_Low_leg(start_idx:end);
+tabl_H_bab   = bab_High_leg(start_idx:end);
+tbl_bab = bab_factor(start_idx:end);
+
+fprintf('\n===============================\n');
+fprintf('  Summary Statistics for BAB\n');
+fprintf('===============================\n');
+
+bab_Labels = {'Low Beta', 'High Beta', 'BAB'};
+data  = [tbl_L_bab, tabl_H_bab, tbl_bab];
+
+fprintf('--------------------------------------------------------------------------\n');
+fprintf('%-12s | %-12s | %-12s | %-8s | %-3s\n', 'Portfolio', 'Mean Ret', 'Std Dev', 't-stat', 'Significance = 5%');
+fprintf('--------------------------------------------------------------------------\n');
+
+for i = 1:3
+    series = data(:, i);
+    
+    % Calculate Statistics
+    mu_bab = mean(series, 'omitnan') * 100;
+    sigma_bab = std(series, 'omitnan') * 100;
+
+    n_obs_bab = sum(~isnan(series));
+    se_bab = std(series, 'omitnan') / sqrt(n_obs_bab);
+    t_stat_bab = mean(series, 'omitnan') / se_bab;
+
+    sig = '';
+    if abs(t_stat_bab) > 1.96 % 5% Significance
+        sig = '**';
+    end
+
+    fprintf('%-12s | %8.4f%%    | %8.4f%%    | %8.2f | %s\n', bab_Labels{i}, mu_bab, sigma_bab, t_stat_bab, sig);
+end
+
+fprintf('--------------------------------------------------------------------------\n');
+
+% BAB against Years
+figure;
+plot(dates(start_idx:end), cumprod(1 + tbl_bab), 'LineWidth', 1.5);
+title('BAB: Growth of $1 (Cumulative Return)'); 
+ylabel('Wealth Index ($)'); 
+xlabel('Year')
+grid on;
+xtickformat('yyyy');
+
+%% MOMENTUM 
+
+sharpe_matrix = nan(12, 12);
+gross_wealth_matrix = nan(12, 12); 
+MOM_Storage = nan(T, 12, 12);
+
+for L = L_range
+    for H = H_range
+        mom_rets_full = nan(T, 1);
+        start_t = L + H + 1; 
+        
+        for t = start_t : T
+            cohort_sum = 0; valid_cohorts = 0;
+            for lag = 1:H
+                form_t = t - lag;
+                if form_t > L
+                    past_cum = prod(1 + industry_returns(form_t-L:form_t-1, :), 1, 'omitnan') - 1;
+                    [~, sort_idx] = sort(past_cum, 'descend', 'MissingPlacement', 'last');
+                    n_port = round(0.2 * N);
+                    
+                    mom_W = mean(industry_returns(t, sort_idx(1:n_port)), 'omitnan');
+                    mom_L = mean(industry_returns(t, sort_idx(end-n_port+1:end)), 'omitnan');
+                    
+                    cohort_sum = cohort_sum + (mom_W - mom_L);
+                    valid_cohorts = valid_cohorts + 1;
+                end
+            end
+            if valid_cohorts > 0
+                mom_rets_full(t) = cohort_sum/valid_cohorts; 
+            end
+        end
+        
+        % Store time series
+        MOM_Storage(:, L, H) = mom_rets_full;
+
+        valid_data = mom_rets_full(~isnan(mom_rets_full));
+        if ~isempty(valid_data)
+            sharpe_matrix(L, H) = (mean(valid_data)/std(valid_data))*sqrt(12);
+            gross_wealth_matrix(L, H) = prod(1 + valid_data); 
+        end
+    end
+end
+
+% Sharpe Heatmap
+figure;
+h1 = heatmap(H_range, L_range, sharpe_matrix);
+h1.Title = 'Sharpe Ratio'; 
+h1.XLabel = 'Holding (H)'; 
+h1.YLabel = 'Lookback (L)'; 
+h1.Colormap = jet;
+
+% Return on $1 Heatmap
+figure;
+h2 = heatmap(H_range, L_range, round(gross_wealth_matrix, 2));
+h2.Title = 'Wealth Index (Value of $1)'; 
+h2.XLabel = 'Holding (H)'; 
+h2.YLabel = 'Lookback (L)'; 
+h2.Colormap = jet;
+
+% MOM Spag Graph  (ALL 144 STRATEGIES)
+fprintf('\n Graph of 144 Combinations\n');
+
+figure; hold on;
+title('Momentum Strategy: 144 Combinations of L:H (Growth of $1)');
+xlabel('Year'); ylabel('Wealth Index ($)');
+grid on;
+
+all_wealth = nan(T, 144);
+final_values = nan(144, 1);
+labels = cell(144, 1);
+
+count = 0;
+% Loop through every L:H
+for L = L_range
+    for H = H_range
+        count = count + 1;
+        
+        % Extract raw returns
+        r_series = MOM_Storage(:, L, H);
+        % CLEANING FOR GRAPH: 
+        r_series(isnan(r_series)) = 0;
+        % Wealth
+        w_series = cumprod(1 + r_series);
+        % Storage
+        all_wealth(:, count) = w_series;
+        final_values(count) = w_series(end);
+        labels{count} = sprintf('L=%d, H=%d', L, H);
+    end
+end
+
+
+[sorted_vals, sort_idx] = sort(final_values, 'ascend');
+colors = jet(144); 
+
+% Plot
+for i = 1:144
+    idx = sort_idx(i);
+    lw = 0.5;
+    plot(dates, all_wealth(:, idx), 'Color', colors(i, :), 'LineWidth', lw);
+end
+
+xtickformat('yyyy')
+axis tight;
+colormap jet;
+c = colorbar;
+clim([min(final_values) max(final_values)]);
+
+fprintf('Top Performing Combination: %s (Final Wealth: $%.2f)\n', labels{sort_idx(end)}, sorted_vals(end));
+fprintf('Worst Performing Combination: %s (Final Wealth: $%.2f)\n', labels{sort_idx(1)}, sorted_vals(1));
+
+
+%% KAN ET AL. (2013) 
+test_idx = start_idx:T;
+
+Yi = industry_returns(test_idx, :) - rf_rate(test_idx);
+[T_reg, N_assets] = size(Yi);
+
+F_Mkt = mkt_excess(test_idx);
+F_SMB = smb_factor(test_idx);
+F_HML = hml_factor(test_idx);
+F_MOM = MOM_Storage(test_idx, 12, 1); 
+F_BAB = tbl_bab;
+
+Factors_Master = [F_Mkt, F_SMB, F_HML, F_MOM, F_BAB];
+
+fprintf('Test Period: %d Months | Test Assets: %d Industries\n', T_reg, N_assets);
+fprintf('Master Factor Matrix Created: %d x %d\n', size(Factors_Master));
+
+function [R2_adj, avg_ret, pred_ret, avg_ts_R2] = kan_analysis(Re_assets, Factors, FactorLabels)
+    [T, N] = size(Re_assets);
+    [~, K] = size(Factors);
+    
+    % Covariance of Factors 
+    Var_F = cov(Factors);
+    Mean_F = mean(Factors)';
+    
+    % Regression
+    X_ts = [ones(T, 1), Factors];
+    Beta_hat = X_ts \ Re_assets; % (1+K) x N matrix
+    
+    alphas = Beta_hat(1, :)';     % Pricing Errors
+    betas  = Beta_hat(2:end, :)'; % N x K matrix of Betas
+    residuals = Re_assets - X_ts * Beta_hat;
+    Sigma_resid = cov(residuals); % Residual Covariance Matrix
+
+    % Total Sum of Squares = Variance of actual returns
+    TSS = sum((Re_assets - mean(Re_assets)).^2);
+    % Residual Sum of Squares = Variance of errors
+    RSS = sum(residuals.^2);
+    % R2 for each portfolio
+    ts_R2_all = 1 - (RSS ./ TSS);
+    % Average Time-Series R2
+    avg_ts_R2 = mean(ts_R2_all);
+    
+    % Cross-Sectional Regression
+    % Model: E[R_i] = lambda_0 + beta_i * lambda_f    
+    avg_return = mean(Re_assets)';
+    
+    X_cs = [ones(N,1), betas]; 
+    
+    Lambdas = (X_cs' * X_cs) \ (X_cs' * avg_return);
+    lambda_zero = Lambdas(1);
+    risk_premia = Lambdas(2:end);
+    
+    pred_ret = X_cs * Lambdas;
+        
+    % Cross-Sectional R-Squared
+    % R2 = 1 - Var(PricingError) / Var(AvgReturns)
+    pricing_errors = avg_return - pred_ret;
+    R2_adj = 1 - var(pricing_errors) / var(avg_return);
+    
+    % Shanken Correction 
+    shanken_term = 1 + Lambdas(2:end)' * inv(Var_F) * Lambdas(2:end);
+    
+    % Variance of Lambdas 
+    % Ainv = inv(X_cs' * X_cs);
+    % Cov_Lambda = (1/T) * (Ainv * (X_cs' * Sigma_resid * X_cs) * Ainv * shanken_term + Var_F_expanded);
+    % Standard Errors = sqrt( (1/T) * (Sigma_resid_avg * Ainv * (1 + lambda' inv(Vf) lambda)) + V_factors )
+    se_raw = sqrt(diag(inv(X_cs'*X_cs) * (X_cs'*Sigma_resid*X_cs)) / T * shanken_term);
+    
+     t_stats = Lambdas ./ se_raw;
+     avg_ret = mean(Re_assets)';  
+     pred_ret = X_cs * Lambdas;
+     pricing_errors = avg_ret - pred_ret;
+     R2_adj = 1 - var(pricing_errors) / var(avg_ret);
+    
+    % Results
+    fprintf('--------------------------------------------------\n');
+    fprintf('  Cross-Sectional R-Squared:      %.3f (%.1f%%) \n', R2_adj, R2_adj*100);
+    fprintf('  Time-Series R-Squared (Avg):    %.3f (%.1f%%) \n', avg_ts_R2, avg_ts_R2*100);
+    fprintf('--------------------------------------------------\n');
+    fprintf('%-10s | %-10s | %-10s | %-10s\n', 'Factor', 'Risk Prem', 't-stat', 'Significance = 5%');
+    fprintf('--------------------------------------------------\n');
+    
+    sig = ''; 
+    if abs(t_stats(1)) > 1.96, sig = '**'; 
+    end
+
+    fprintf('%-10s | %8.4f   | %8.2f   | %s\n', 'Intercept', lambda_zero*100, t_stats(1), sig);
+    
+    for i = 1:K
+        sig = ''; if abs(t_stats(i+1)) > 1.96, sig = '**'; end
+        fprintf('%-10s | %8.4f%%  | %8.2f   | %s\n', FactorLabels{i}, risk_premia(i)*100, t_stats(i+1), sig);
+    end
+    disp(' ')
+
+    % GRS
+    if T > (N + K + 2)
+        [GRS_stat, p_val] = grs(Factors, Re_assets);
+
+        fprintf('GRS Test Statistic = %.4f | p-value = %.4f\n', GRS_stat, p_val);
+
+        if p_val < 0.05
+            fprintf('Model fails GRS test: alphas jointly significantly different from zero.\n');
+        else
+            fprintf('Model passes GRS test: no evidence of joint alpha.\n');
+        end
+        disp(' ')
+    end
+end
+
+%% Models Tables
+fprintf('\n============================================\n');
+fprintf('                 Model Tables               \n');
+fprintf('============================================\n');
+num_models = size(global_models, 1);
+
+figure; 
+t = tiledlayout(1, num_models, 'TileSpacing', 'compact');
+title(t, 'Model Fit: Realized vs. Predicted Returns');
+
+% Loop global
+for i = 1:num_models
+    col_indices = global_models{i, 1}; 
+    curr_labels = global_models{i, 2}; 
+    curr_title  = global_models{i, 3}; 
+    curr_color  = global_models{i, 4}; 
+    curr_factors = Factors_Master(:, col_indices);
+    
+    [r2, y_real, y_pred] = kan_analysis(Yi, curr_factors, curr_labels);
+    
+    nexttile;
+    scatter(y_pred*100, y_real*100, 50, 'filled', 'MarkerFaceColor', curr_color);
+    hold on;
+    
+    h_line = refline(1, 0);
+    h_line.Color = [0.49, 0.18, 0.56]; % Purple
+    h_line.LineWidth = 1.5;            
+    h_line.LineStyle = '--';           
+    
+    title(sprintf('%s\nR^2: %.1f%%', curr_title, r2*100));
+    xlabel('Predicted Return (%)'); 
+    if i == 1
+        ylabel('Realized Return (%)');
+    end
+    grid on;
+end
+
+%% Period Heatmaps
+fprintf('\n Decade & Crisis Heatmaps\n');
+
+% Periods
+periods = {
+    '1970s',       1970, 1979;
+    '1980s',       1980, 1989;
+    '1990s',       1990, 1999;
+    '2000s',       2000, 2009;
+    '2010s',       2010, 2019;
+    '2020s',       2020, 2029;
+    '2000-2020',   2000, 2019;
+    'GFC Crisis',  2007, 2012;  % Crisis 
+};
+
+% Extract date
+data_years = year(dates);
+
+num_plots = size(periods, 1);
+figure;
+t = tiledlayout('flow', 'TileSpacing', 'compact'); 
+
+for p = 1:num_plots
+    p_name = periods{p, 1};
+    p_start = periods{p, 2};
+    p_end   = periods{p, 3};
+    
+    idx_period = (data_years >= p_start) & (data_years <= p_end);
+    period_wealth_matrix = nan(12, 12);
+    
+    for L = L_range
+        for H = H_range
+            full_series = MOM_Storage(:, L, H);
+            period_rets = full_series(idx_period);
+            
+            % Growth on $1 
+            if any(~isnan(period_rets))
+                period_wealth_matrix(L, H) = prod(1 + period_rets, 'omitnan');
+            end
+        end
+    end
+    
+    % Heatmap 
+    nexttile;
+    hm = heatmap(1:12, 1:12, round(period_wealth_matrix, 2));
+    hm.Title = sprintf('%s', p_name);
+    hm.XLabel = 'H'; 
+    hm.YLabel = 'L';
+    hm.Colormap = jet; 
+end
+title(t, 'Momentum: Wealth Index by Period on $1');
+
+%% Crisis Periods
+fprintf('\n============================================\n');
+fprintf('               Crisis Period                   \n');
+fprintf('============================================\n');
+
+custom_periods = {
+    % Name             StartM   StartY   EndM  EndY
+    'GFC Crisis',      12,      2007,     6,   2009; 
+};
+
+num_models_global = size(global_models, 1);
+num_periods = size(custom_periods, 1);
+
+r2_storage = nan(num_periods, num_models_global); 
+period_labels = custom_periods(:, 1);
+
+test_dates = dates(test_idx);
+data_years = year(test_dates);
+
+% Period Loop
+for i = 1:num_periods
+    p_name    = custom_periods{i, 1};
+    p_m_start = custom_periods{i, 2};
+    p_y_start = custom_periods{i, 3};
+    p_m_end   = custom_periods{i, 4};
+    p_y_end   = custom_periods{i, 5};
+
+    serial_start = datetime(p_y_start, p_m_start, 1);
+    serial_end   = datetime(p_y_end,   p_m_end,   1);
+    
+    fprintf('\n %s (%02d/%d - %02d/%d)\n', p_name, p_m_start, p_y_start, p_m_end, p_y_end);
+    
+    mask = (test_dates >= serial_start) & (test_dates <= serial_end);
+
+    if sum(mask) < 6
+        fprintf(' [SKIP] Not enough data for this period.\n');
+        continue;
+    end
+    
+    Yi_sub = Yi(mask, :);
+    
+    F_sub_all = Factors_Master(mask, :); 
+    
+    figure;
+    t = tiledlayout(1, num_models_global, 'TileSpacing', 'compact');
+    title(t, sprintf('Model Fit: %s (%d-%d)', p_name, p_y_start, p_y_end));
+    
+    % Loop
+    for m = 1:num_models_global
+
+        col_indices = global_models{m, 1}; 
+        curr_labels = global_models{m, 2}; 
+        curr_title  = global_models{m, 3}; 
+        curr_color  = global_models{m, 4}; 
+        curr_factors = F_sub_all(:, col_indices);
+        
+        [r2, real_y, pred_y] = kan_analysis(Yi_sub, curr_factors, curr_labels);
+        r2_storage(i, m) = r2;
+        
+        % Plot
+        nexttile;
+        scatter(pred_y*100, real_y*100, 30, 'filled', 'MarkerFaceColor', curr_color);
+        hold on;
+        % 45-degree line
+        h_line = refline(1, 0);
+        h_line.Color = [0.49, 0.18, 0.56]; % Purple
+        h_line.LineWidth = 1.5;            
+        h_line.LineStyle = '--';           
+
+        % Format
+        title(sprintf('%s\nR^2: %.1f%%', curr_title, r2*100));
+        xlabel('Pred (%)'); 
+        if m == 1, ylabel('Realized (%)'); end 
+        grid on;
+    end
+end
+
+
+%% Month Inspector
+fprintf('\n============================================\n');
+fprintf('               Month Inspector                 \n');
+fprintf('============================================\n');
+
+target_date = datetime(target_year, target_month, 1); 
+
+fprintf('Targeting Date: %s\n', datetime(target_date));
+fprintf('Strategy: Lookback L=%d, Holding H=%d\n', L_specific, H_specific);
+
+% Run loop
+start_t = L_specific + H_specific + 1; 
+found_target = false;
+
+for t = start_t : T
+
+    is_same_year  = (dates(t).Year == target_date.Year);
+    is_same_month = (dates(t).Month == target_date.Month);
+
+    if is_same_year && is_same_month
+        found_target = true;
+        
+        cohort_sum = 0; 
+        valid_cohorts = 0;
+        
+        display_winners_idx = [];
+        display_losers_idx = [];
+        display_past_rets = [];
+        display_formation_dates = [];
+        
+        for lag = 1:H_specific
+            form_t = t - lag;
+            if form_t > L_specific
+                % LookBack
+                past_cum = prod(1 + industry_returns(form_t-L_specific:form_t-1, :), 1, 'omitnan') - 1;
+                [sorted_rets, sort_idx] = sort(past_cum, 'descend', 'MissingPlacement', 'last');
+                n_port = round(0.2 * N);
+                % Ranking
+                win_idx = sort_idx(1:n_port);
+                lose_idx = sort_idx(end-n_port+1:end);
+                % Returns W & L
+                mom_W = mean(industry_returns(t, win_idx), 'omitnan');
+                mom_L = mean(industry_returns(t, lose_idx), 'omitnan');
+                cohort_sum = cohort_sum + (mom_W - mom_L);
+                valid_cohorts = valid_cohorts + 1;
+                
+                if lag == 1
+                    display_winners_idx = win_idx;
+                    display_losers_idx = lose_idx;
+                    display_past_rets = sorted_rets;
+                    display_formation_dates = [dates(form_t-L_specific), dates(form_t-1)];
+                end
+            end
+        end
+
+        final_mom_return = cohort_sum / valid_cohorts;
+        
+        % Output        
+        fprintf('Formation Period for Table: %s to %s\n', string(display_formation_dates(1)), string(display_formation_dates(2)));
+        
+        fprintf('\nWinners (Top 20%%)\n');
+        fprintf('%-15s | %-12s | %-12s\n', 'Industry', 'Past Return', 'Curr Return');
+        fprintf('-----------------------------------------------\n');
+        for k = 1:length(display_winners_idx)
+            id = display_winners_idx(k);
+
+            past_r = display_past_rets(k); 
+            curr_r = industry_returns(t, id);
+            fprintf('%-15s | %11.2f%% | %11.2f%%\n', portfolio_names{id}, past_r*100, curr_r*100);
+        end
+        
+        fprintf('\nLosers (Bottom 20%%)\n');
+        fprintf('%-15s | %-12s | %-12s\n', 'Industry', 'Past Return', 'Curr Return');
+        fprintf('-----------------------------------------------\n');
+        
+        start_loser_rank = N - length(display_losers_idx) + 1;
+        
+        for k = 1:length(display_losers_idx)
+            id = display_losers_idx(k);
+            past_r = display_past_rets(start_loser_rank + k - 1);
+            curr_r = industry_returns(t, id);
+            fprintf('%-15s | %11.2f%% | %11.2f%%\n', portfolio_names{id}, past_r*100, curr_r*100);
+        end
+        % MOM @ that month
+        fprintf('\n-----------------------------------------------\n');
+        fprintf(' MOM STRATEGY RETURN: %.2f%%\n', final_mom_return*100);
+        fprintf('-----------------------------------------------\n');
+        
+        break; 
+    end
+end
+
+if ~found_target
+    fprintf('\n[ERROR] Date %02d-%d not found in data range.\n', target_month, target_year);
+end
+
+%% Monthly Weath Index 
+
+% BAB Weath Index 
+bab_wealth = cumprod(1 + tbl_bab);
+bab_dates  = dates(start_idx:end);
+
+fprintf('\n=========================================\n');
+fprintf('     BAB Wealth Index (Growth of $1)     \n');
+fprintf('=========================================\n');
+fprintf('--- FIRST 5 MONTHS ---\n');
+for i = 1:5
+    fprintf('%s : $%.4f\n', string(bab_dates(i)), bab_wealth(i));
+end
+
+fprintf('\n--- LAST 5 MONTHS ---\n');
+for i = length(bab_wealth)-4 : length(bab_wealth)
+    fprintf('%s : $%.4f\n', string(bab_dates(i)), bab_wealth(i));
+end
+
+% MOM Weath Index 
+spec_mom_rets = [];
+spec_dates = [];
+start_t = L_specific + H_specific + 1;
+
+for t = start_t : T
+    form_t = t - 1; 
+    past_cum = prod(1 + industry_returns(form_t-L_specific:form_t-1, :), 1, 'omitnan') - 1;
+    [~, sort_idx] = sort(past_cum, 'descend', 'MissingPlacement', 'last');
+    n_port = round(0.2 * N);
+    
+    % Winner - Loser
+    mom_W = mean(industry_returns(t, sort_idx(1:n_port)), 'omitnan');
+    mom_L = mean(industry_returns(t, sort_idx(end-n_port+1:end)), 'omitnan');
+    
+    spec_mom_rets = [spec_mom_rets; (mom_W - mom_L)];
+    spec_dates = [spec_dates; dates(t)];
+end
+
+mom_wealth = cumprod(1 + spec_mom_rets);
+
+fprintf('\n=========================================\n');
+fprintf('             MOM Wealth Index             \n');
+fprintf('=========================================\n');
+fprintf('--- FIRST 5 MONTHS ---\n');
+for i = 1:5
+    fprintf('%s : $%.4f\n', string(spec_dates(i)), mom_wealth(i));
+end
+
+fprintf('\n--- LAST 5 MONTHS ---\n');
+for i = length(mom_wealth)-4 : length(mom_wealth)
+    fprintf('%s : $%.4f\n', string(spec_dates(i)), mom_wealth(i));
+end
+fprintf('\n');
+
+
+
+%% Transactional Costs
+fprintf('\n============================================\n');
+fprintf('            Transactional Costs             \n');
+fprintf('============================================\n');
+
+% Gross Returns
+raw_mom = MOM_Storage(:, 12, 1);
+raw_mom(isnan(raw_mom)) = 0;
+
+net_mom = raw_mom - trading_cost;
+
+% Compare
+gross_wealth = cumprod(1 + raw_mom);
+net_wealth   = cumprod(1 + net_mom);
+
+figure;
+plot(dates, gross_wealth, 'b', 'LineWidth', 1.5); hold on;
+plot(dates, net_wealth, 'r--', 'LineWidth', 1.5);
+xtickformat('yyy');
+legend('Gross Return (Theoretical)', 'Net Return (After Costs)', 'Location', 'best');
+title('Impact of Transaction Costs on Momentum (H=1)');
+grid on;
+
+fprintf('Final Gross Wealth: $%.2f\n', gross_wealth(end));
+fprintf('Final Net Wealth:   $%.2f\n', net_wealth(end));
+
+if net_wealth(end) < 1
+    fprintf('CONCLUSION: Costs wiped out the profit. Increase H to 3 or 6.\n');
+else
+    fprintf('CONCLUSION: Strategy survives transaction costs!\n');
+end
+
+net_sharpe_matrix = nan(12, 12);
+net_wealth_matrix = nan(12, 12);
+best_sharpe = -inf;
+best_L = 0; best_H = 0;
+best_wealth = -inf;
+best_W_L = 0; best_W_H = 0;
+
+for L= L_range
+    for H= H_range
+        % Gross Returns
+        return_gross = MOM_Storage(:, L, H);
+        
+        % Apply Cost Adjustment
+        monthly_drag = trading_cost / H;
+        
+        return_net = return_gross;
+        valid_idx = ~isnan(return_gross);
+        return_net(valid_idx) = return_gross(valid_idx) - monthly_drag;
+        
+        valid_data = return_net(valid_idx);
+        if ~isempty(valid_data)
+            % Annualized Sharpe
+            shp_ratio = (mean(valid_data) / std(valid_data)) * sqrt(12);
+            net_sharpe_matrix(L, H) = shp_ratio;
+            
+            % Wealth
+            net_wealth_matrix(L, H) = prod(1 + valid_data);
+            
+            if shp_ratio > best_sharpe
+                best_sharpe = shp_ratio;
+                best_S_L = L;
+                best_S_H = H;
+            end
+            
+            final_w = prod(1 + valid_data);
+            net_wealth_matrix(L, H) = final_w;
+
+            if final_w > best_wealth
+                best_wealth = final_w;
+                best_W_L = L;
+                best_W_H = H;
+            end
+            
+        end
+    end
+end
+
+% Output 
+fprintf('--------------------------------------\n');
+fprintf('%.2f bps cost per transaction\n', trading_cost*10000);
+fprintf('--------------------------------------\n');
+
+fprintf('Best Sharpe Ratio\n');
+fprintf('    - L=%d, H=%d\n', best_S_L, best_S_H);
+fprintf('    - Sharpe: %.2f\n', best_sharpe);
+fprintf('    - Wealth: $%.2f\n', net_wealth_matrix(best_S_L, best_S_H));
+
+fprintf('\nHighest Final Wealth\n');
+fprintf('    - L=%d, H=%d\n', best_W_L, best_W_H);
+fprintf('    - Sharpe: %.2f\n', net_sharpe_matrix(best_W_L, best_W_H));
+fprintf('    - Wealth: $%.2f\n', best_wealth);
+
+% Transactional Heatmap on $1
+net_wealth_matrix = nan(12, 12);
+
+% Loop
+for L = L_range
+    for H = H_range
+        return_gross = MOM_Storage(:, L, H);
+        monthly_drag = trading_cost / H;
+        valid_idx = ~isnan(return_gross);
+        return_net = return_gross;
+        
+        return_net(valid_idx) = return_gross(valid_idx) - monthly_drag;
+        
+        % Growth on $1
+        if any(valid_idx)
+            net_wealth_matrix(L, H) = prod(1 + return_net(valid_idx));
+        end
+    end
+end
+
+figure;
+h = heatmap(H_range, L_range, round(net_wealth_matrix, 2));
+h.Title = sprintf('Return on $1 (%.2f%% Trading Cost)', trading_cost*100);
+h.XLabel = 'Holding Period (H)';
+h.YLabel = 'Lookback Period (L)';
+h.Colormap = jet;
+
+max_val = max(net_wealth_matrix, [], 'all');
+h.ColorLimits = [0 max_val]; 
+
+%  Theoretical vs Transactinal
+figure;
+t = tiledlayout(2, 2);
+
+% Theoretical Sharpe
+nexttile;
+heatmap(1:MAX_H, 1:MAX_L, round(sharpe_matrix, 2)); 
+title('Theoretical Sharpe');
+xlabel('H'); 
+ylabel('L');
+colormap jet; 
+clim([0 max(sharpe_matrix,[],'all')]);
+
+% Net Transactinal Sharpe
+nexttile;
+heatmap(1:MAX_H, 1:MAX_L, round(net_sharpe_matrix, 2));
+title(sprintf('Net Transactinal Sharpe (After %.1f%% Cost)', trading_cost*100));
+xlabel('H'); 
+ylabel('L');
+colormap jet; 
+clim([0 max(sharpe_matrix,[],'all')]);
+
+% Theoretical Wealth
+nexttile;
+heatmap(1:MAX_H, 1:MAX_L, round(gross_wealth_matrix, 1)); 
+title('Gross Wealth (Theoretical $1)');
+xlabel('H'); 
+ylabel('L');
+colormap jet;
+h.ColorLimits = [0 max_val]; 
+
+% Net Wealth
+nexttile;
+heatmap(1:MAX_H, 1:MAX_L, round(net_wealth_matrix, 1));
+title(sprintf('Net Wealth (After Cost: %.1f%%)', trading_cost*100));
+xlabel('H'); 
+ylabel('L');
+colormap jet; 
+h.ColorLimits = [0 max_val]; 
